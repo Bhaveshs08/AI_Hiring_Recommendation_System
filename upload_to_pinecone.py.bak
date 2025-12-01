@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+upload_to_pinecone.py (robust loader, utf-8-sig, BOM-safe)
+
+Usage example:
+  python upload_to_pinecone.py --file ./data/resumes/SomeResume.json --namespace Resumes --index polaris --id-method uuid
+"""
+import os, sys, json, argparse, hashlib, uuid, re
+from pathlib import Path
+from datetime import datetime
+from time import sleep
+
+# Pinecone/OpenAI imports (unchanged)
+from pinecone import Pinecone
+from openai import OpenAI
+
+# ---------------- CLI ----------------
+parser = argparse.ArgumentParser(description="Upload JSON chunks to Pinecone index.")
+parser.add_argument("--file", required=True, help="Path to JSON file containing chunk data.")
+parser.add_argument("--namespace", required=True, help="Pinecone namespace name.")
+parser.add_argument("--index", required=False, help="Pinecone index name (if not set via env).")
+parser.add_argument("--id-method", choices=["email","name","content_hash","uuid"], default="uuid", help="Method to compute candidate_id (script honors embedded candidate_id if present).")
+args = parser.parse_args()
+
+INPUT_FILE = args.file
+NAMESPACE = args.namespace
+INDEX_NAME = args.index or os.environ.get("PINECONE_INDEX")
+PINECONE_KEY = os.environ.get("PINECONE_API_KEY")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+
+if not PINECONE_KEY or not INDEX_NAME:
+    print("Missing PINECONE_API_KEY or PINECONE_INDEX. Set them in environment or pass --index.")
+    sys.exit(2)
+if not OPENAI_KEY:
+    print("Missing OPENAI_API_KEY. Please export or set it before running.")
+    sys.exit(3)
+if not os.path.exists(INPUT_FILE):
+    print(f"File not found: {INPUT_FILE}")
+    sys.exit(1)
+
+# ---------------- init clients ----------------
+pc = Pinecone(api_key=PINECONE_KEY)
+index = pc.Index(INDEX_NAME)
+client = OpenAI(api_key=OPENAI_KEY)
+
+# ---------------- utility sanitizers ----------------
+_RE_CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+def strip_control_and_bom(s):
+    if s is None:
+        return s
+    if not isinstance(s, str):
+        s = str(s)
+    # BOM removal + control char stripping + collapse whitespace
+    s = s.replace('\ufeff', '')
+    s = _RE_CONTROL.sub(' ', s)
+    s = " ".join(s.split())
+    return s
+
+def sanitize_metadata(meta: dict) -> dict:
+    out = {}
+    for k, v in (meta or {}).items():
+        if isinstance(v, str):
+            out[k] = strip_control_and_bom(v)
+        elif isinstance(v, (int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, list):
+            out[k] = [ strip_control_and_bom(x) if isinstance(x, str) else x for x in v ]
+        else:
+            out[k] = strip_control_and_bom(v)
+    return out
+
+# ---------------- robust JSON loader ----------------
+def load_json_file_strict(path: str):
+    """
+    - Opens file using utf-8-sig (handles BOM)
+    - Accepts top-level list OR dict
+      * If dict and contains keys like 'chunks' -> use that list
+      * If dict appears to be a single chunk object -> wrap in a list
+    - Cleans BOM/control chars from string fields and metadata
+    - Returns normalized list of chunk dicts
+    """
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        text = fh.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        # try fallback: remove weird leading BOM explicitly and reparse
+        txt2 = text.lstrip('\ufeff')
+        try:
+            data = json.loads(txt2)
+        except Exception:
+            raise RuntimeError(f"Failed to JSON-decode file {path}: {e}")
+
+    # Normalize: if dict -> try to find list inside or wrap single chunk
+    if isinstance(data, dict):
+        # if common key 'chunks' or 'items' present
+        for key in ("chunks","items","data","vectors"):
+            if key in data and isinstance(data[key], list):
+                data = data[key]
+                break
+        else:
+            # single chunk object? wrap it
+            # detection: has 'id' and ('chunk_text' or 'text' or 'values' in keys)
+            if ("id" in data) and (("chunk_text" in data) or ("text" in data) or ("values" in data)):
+                data = [data]
+            else:
+                # try to find any list value in dict and use it (best-effort)
+                found = None
+                for v in data.values():
+                    if isinstance(v, list):
+                        found = v; break
+                if found is not None:
+                    data = found
+                else:
+                    raise RuntimeError("input JSON must be a list of chunk objects (or a dict containing 'chunks' list).")
+
+    if not isinstance(data, list):
+        raise RuntimeError("input JSON must be a list of chunk objects.")
+
+    # sanitize each chunk: remove BOMs in string fields & metadata
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        # sanitize top-level string fields
+        for k,v in list(obj.items()):
+            if isinstance(v, str):
+                obj[k] = strip_control_and_bom(v)
+        # sanitize metadata object
+        meta = obj.get("metadata", {})
+        if isinstance(meta, dict):
+            obj["metadata"] = sanitize_metadata(meta)
+        else:
+            obj["metadata"] = {}
+    return data
+
+# ---------------- load input JSON ----------------
+try:
+    chunks = load_json_file_strict(INPUT_FILE)
+except Exception as e:
+    print(f"ERROR loading input JSON: {e}")
+    sys.exit(1)
+
+if not chunks:
+    print("No chunks found in input JSON.")
+    sys.exit(1)
+
+print(f"Loaded {len(chunks)} chunk(s) from {INPUT_FILE}")
+
+# ---------------- prepare items (preserve candidate_id if present) ----------------
+items = []
+for obj in chunks:
+    _id = obj.get("id") or f"{obj.get('candidate_id','candidateX')}_chunk{obj.get('chunk_index','X')}"
+    text = obj.get("chunk_text") or obj.get("text") or obj.get("full_text") or ""
+    if not text or not text.strip():
+        print(f"Skipping {_id}: no text found.")
+        continue
+    metadata = obj.get("metadata", {}) or {}
+    # ensure candidate_id exists
+    if not metadata.get("candidate_id") and obj.get("candidate_id"):
+        metadata["candidate_id"] = obj.get("candidate_id")
+    metadata["source_file"] = metadata.get("source_file") or os.path.basename(INPUT_FILE)
+    items.append({"id": _id, "text": text.strip(), "metadata": sanitize_metadata(metadata)})
+
+if not items:
+    print("No valid chunks found to upload.")
+    sys.exit(1)
+
+print(f"Prepared {len(items)} items for embedding and upload")
+
+# ---------------- Embeddings & upsert (use your existing code path) ----------------
+# --- here we reuse your existing embedding + upsert pipeline, simplified ---
+def embed_texts(batch):
+    try:
+        resp = client.embeddings.create(model="text-embedding-3-large", input=batch)
+        embs = [r.embedding for r in resp.data]
+        return embs
+    except Exception as e:
+        print("Embedding generation failed:", e)
+        raise
+
+BATCH_SIZE = 50
+for i in range(0, len(items), BATCH_SIZE):
+    batch = items[i:i+BATCH_SIZE]
+    texts = [b["text"] for b in batch]
+    embeddings = embed_texts(texts)
+    if len(embeddings) != len(batch):
+        print("Embedding length mismatch; aborting.")
+        sys.exit(1)
+    upsert_batch = [(b["id"], vec, b["metadata"]) for b, vec in zip(batch, embeddings)]
+    try:
+        index.upsert(vectors=upsert_batch, namespace=NAMESPACE)
+        print(f" Upserted {len(upsert_batch)} vectors ({i+len(upsert_batch)}/{len(items)})")
+    except Exception as e:
+        print("Upsert failed:", e)
+        sys.exit(1)
+
+print("All chunks uploaded successfully.")

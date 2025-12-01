@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""
+compute_resume_jd_scores.py
+
+- Fetches resume chunk vectors from Pinecone namespace 'Resumes'
+- Fetches JD vectors from Pinecone namespace 'Job_Descriptions'
+- Computes cosine similarity between every resume chunk and every JD vector
+- Writes chunk-level scores to resume_jd_scores.csv
+- Aggregates chunk scores to candidate-level using section-weighted mean and writes candidate_jd_scores.csv
+
+Usage:
+  python compute_resume_jd_scores.py
+
+Environment required:
+  - PINECONE_API_KEY
+  - PINECONE_INDEX
+Run from project root where your venv provides pinecone client.
+"""
+
+import os
+import sys
+import csv
+import math
+from collections import defaultdict
+from typing import List, Dict
+from pathlib import Path
+
+# --- Config ---
+RESUMES_NS = "Resumes"
+JDS_NS = "Job_Descriptions"
+OUT_CHUNK_CSV = "resume_jd_scores.csv"
+OUT_CAND_CSV = "candidate_jd_scores.csv"
+LIST_LIMIT = 100  # how many ids to list in namespaces (adjust/paginate if needed)
+
+# Section weights: tweak as necessary
+SECTION_WEIGHTS = {
+    "skills": 0.45,
+    "experience": 0.35,
+    "experience_summary": 0.35,
+    "professional_summary": 0.10,
+    "projects": 0.07,
+    "projects_certifications_achievements": 0.07,
+    "projects_certifications": 0.07,
+    "education": 0.03,
+    "education_summary": 0.03,
+}
+DEFAULT_WEIGHT = 0.05
+
+# -------------------- Pinecone init --------------------
+PINECONE_KEY = os.environ.get("PINECONE_API_KEY")
+INDEX_NAME = os.environ.get("PINECONE_INDEX")
+
+if not PINECONE_KEY or not INDEX_NAME:
+    print("ERROR: PINECONE_API_KEY and PINECONE_INDEX must be set in environment.")
+    sys.exit(2)
+
+try:
+    from pinecone import Pinecone
+except Exception as e:
+    print("ERROR: Failed to import Pinecone client. Ensure correct venv and pinecone package installed.")
+    raise
+
+pc = Pinecone(api_key=PINECONE_KEY)
+index = pc.Index(INDEX_NAME)
+
+# -------------------- Helpers --------------------
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    if len(a) != len(b):
+        n = min(len(a), len(b))
+        a = a[:n]; b = b[:n]
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+def safe_get_vector_values(vobj):
+    # Accept dict-like or object-like from various SDK shapes
+    if vobj is None:
+        return []
+    if isinstance(vobj, dict):
+        if "values" in vobj and isinstance(vobj["values"], (list, tuple)):
+            return list(vobj["values"])
+        if "vector" in vobj and isinstance(vobj["vector"], (list, tuple)):
+            return list(vobj["vector"])
+    vals = getattr(vobj, "values", None) or getattr(vobj, "vector", None)
+    if isinstance(vals, (list, tuple)):
+        return list(vals)
+    # final fallback
+    return []
+
+def safe_get_metadata(vobj):
+    if vobj is None:
+        return {}
+    if isinstance(vobj, dict):
+        return vobj.get("metadata", {}) or {}
+    meta = getattr(vobj, "metadata", None)
+    if isinstance(meta, dict):
+        return meta
+    return {}
+
+def list_vector_ids(namespace: str, limit: int = LIST_LIMIT) -> List[str]:
+    """
+    Returns a list of vector ids in the namespace (best-effort).
+    For large corpora, replace with paginated listing.
+    """
+    try:
+        resp = index.list(namespace=namespace, limit=limit)
+    except Exception as e:
+        print(f"Could not list vectors for namespace '{namespace}': {e}")
+        return []
+    ids = []
+    # resp may be generator, list, or object depending on SDK
+    try:
+        for item in resp:
+            if isinstance(item, str):
+                ids.append(item)
+            elif isinstance(item, list):
+                for it in item:
+                    if isinstance(it, str):
+                        ids.append(it)
+                    elif isinstance(it, dict) and "id" in it:
+                        ids.append(it["id"])
+            elif isinstance(item, dict):
+                # common shape: {'matches': [{'id':...}, ...]}
+                if "matches" in item and isinstance(item["matches"], list):
+                    for m in item["matches"]:
+                        if isinstance(m, dict) and "id" in m:
+                            ids.append(m["id"])
+    except TypeError:
+        # resp not iterable; try dict access
+        if isinstance(resp, dict):
+            if "matches" in resp and isinstance(resp["matches"], list):
+                for m in resp["matches"]:
+                    if isinstance(m, dict) and "id" in m:
+                        ids.append(m["id"])
+    # dedupe preserve order
+    return list(dict.fromkeys(ids))
+
+def fetch_vectors_by_ids(ids: List[str], namespace: str) -> Dict[str, Dict]:
+    """
+    Fetch vector objects for ids. Return mapping id -> {'values': [...], 'metadata': {...}}
+    """
+    if not ids:
+        return {}
+    try:
+        fetched = index.fetch(ids=ids, namespace=namespace)
+    except Exception as e:
+        print(f"Fetch failed for namespace='{namespace}': {e}")
+        return {}
+    out = {}
+    vecs = getattr(fetched, "vectors", None)
+    if vecs is None and isinstance(fetched, dict):
+        vecs = fetched.get("vectors", {})
+    if not vecs:
+        return {}
+    if isinstance(vecs, dict):
+        for vid, vobj in vecs.items():
+            out[vid] = {"values": safe_get_vector_values(vobj), "metadata": safe_get_metadata(vobj)}
+    else:
+        # iterable case
+        try:
+            for entry in vecs:
+                if isinstance(entry, dict) and "id" in entry:
+                    vid = entry["id"]
+                    out[vid] = {"values": safe_get_vector_values(entry), "metadata": safe_get_metadata(entry)}
+        except Exception:
+            pass
+    return out
+
+# -------------------- Main --------------------
+def main():
+    print("Listing resume vectors in namespace:", RESUMES_NS)
+    resume_ids = list_vector_ids(RESUMES_NS, limit=LIST_LIMIT)
+    print("Found resumes:", len(resume_ids))
+
+    print("Listing JD vectors in namespace:", JDS_NS)
+    jd_ids = list_vector_ids(JDS_NS, limit=LIST_LIMIT)
+    print("Found JDs:", len(jd_ids))
+
+    if not resume_ids:
+        print("No resume vectors found. Exiting.")
+        return
+    if not jd_ids:
+        print("No JD vectors found. Exiting.")
+        return
+
+    # Fetch vectors (batching could be added for large sets)
+    print("Fetching resume vectors...")
+    resumes = fetch_vectors_by_ids(resume_ids, RESUMES_NS)
+    print(f"Resume vectors available: {len(resumes)}/{len(resume_ids)}")
+
+    print("Fetching JD vectors...")
+    jds = fetch_vectors_by_ids(jd_ids, JDS_NS)
+    print(f"JD vectors available: {len(jds)}/{len(jd_ids)}")
+
+    if not resumes or not jds:
+        print("ERROR: Missing vectors. Cannot compute scores.")
+        return
+
+    # Prepare items
+    resume_items = sorted(resumes.items(), key=lambda x: x[0])  # (id, {values,metadata})
+    jd_items = sorted(jds.items(), key=lambda x: x[0])
+
+    # Compute chunk-level scores
+    chunk_rows = []
+    for r_id, r_obj in resume_items:
+        r_vec = r_obj.get("values") or []
+        for jd_id, jd_obj in jd_items:
+            j_vec = jd_obj.get("values") or []
+            score = cosine_similarity(r_vec, j_vec)
+            chunk_rows.append({
+                "resume_id": r_id,
+                "jd_id": jd_id,
+                "score": float(score),
+                "candidate_id": (r_obj.get("metadata") or {}).get("candidate_id", "")
+            })
+
+    # Write chunk-level CSV
+    with open(OUT_CHUNK_CSV, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["resume_id", "jd_id", "score", "candidate_id"])
+        for r in chunk_rows:
+            w.writerow([r["resume_id"], r["jd_id"], f"{r['score']:.6f}", r.get("candidate_id") or ""])
+
+    # Print top chunk-level results
+    print("\nResume ID | JD ID | Score")
+    for r in sorted(chunk_rows, key=lambda x: x["score"], reverse=True)[:200]:
+        print(f"{r['resume_id']} | {r['jd_id']} | {r['score']:.6f}")
+
+    print(f"\nSaved {len(chunk_rows)} rows to {OUT_CHUNK_CSV}")
+
+    # ------------------ Weighted aggregation to candidate-level ------------------
+    # Map resume_id -> metadata for section extraction
+    resume_meta_map = {rid: (resumes.get(rid, {}).get("metadata") or {}) for rid in resume_ids}
+
+    grouped = defaultdict(list)  # key: (candidate_id, jd_id) -> list of (score, section)
+    for r in chunk_rows:
+        resume_id = r["resume_id"]
+        meta = resume_meta_map.get(resume_id, {}) or {}
+        candidate = meta.get("candidate_id") or ""
+        if not candidate:
+            candidate = resume_id.split("_chunk")[0] if "_chunk" in resume_id else resume_id
+        # section from metadata or derive from id suffix
+        section = (meta.get("section") or "").strip()
+        if not section:
+            # heuristic: everything after first "_chunkN_" part
+            if "_chunk" in resume_id:
+                try:
+                    after = resume_id.split("_chunk", 1)[1]
+                    parts = after.split("_")
+                    # remove leading chunk index token if present (e.g. '1', '1_summary')
+                    # assume section tokens are after the chunk index
+                    if parts and parts[0].isdigit():
+                        section = "_".join(parts[1:]) if len(parts) > 1 else ""
+                    else:
+                        section = "_".join(parts)
+                except Exception:
+                    section = ""
+        section = section.lower()
+        grouped[(candidate, r["jd_id"])].append((r["score"], section))
+
+    cand_rows = []
+    for (candidate, jd), vals in grouped.items():
+        if not vals:
+            continue
+        scores = [s for s, sec in vals]
+        max_score = max(scores)
+        chunks_count = len(vals)
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for score, section in vals:
+            # choose canonical key
+            sec_key = section.split("_")[0] if section else ""
+            # exact match first, then full section, then default
+            w = SECTION_WEIGHTS.get(sec_key,
+                                   SECTION_WEIGHTS.get(section,
+                                                       DEFAULT_WEIGHT))
+            weighted_sum += score * w
+            weight_sum += w
+        weighted_mean = (weighted_sum / weight_sum) if weight_sum > 0 else 0.0
+        cand_rows.append({
+            "candidate_id": candidate,
+            "jd_id": jd,
+            "max_score": round(max_score, 6),
+            "weighted_mean": round(weighted_mean, 6),
+            "chunks_count": chunks_count
+        })
+
+    # sort by weighted_mean
+    cand_rows.sort(key=lambda x: x["weighted_mean"], reverse=True)
+
+    # Write candidate CSV
+    with open(OUT_CAND_CSV, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["candidate_id", "jd_id", "max_score", "weighted_mean", "chunks_count"])
+        for r in cand_rows:
+            w.writerow([r["candidate_id"], r["jd_id"], f"{r['max_score']:.6f}", f"{r['weighted_mean']:.6f}", r["chunks_count"]])
+
+    # Print top candidates
+    print("\nCandidate-level scoring (per JD):")
+    print("Candidate ID | JD ID | max_score | weighted_mean | chunks")
+    for r in cand_rows[:200]:
+        print(f"{r['candidate_id']:40} | {r['jd_id']:30} | {r['max_score']:.6f} | {r['weighted_mean']:.6f} | {r['chunks_count']}")
+
+    print(f"\nSaved {len(cand_rows)} rows to {OUT_CAND_CSV}")
+
+if __name__ == "__main__":
+    main()
